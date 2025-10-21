@@ -7,7 +7,7 @@ This is an automated system for identifying profitable Polymarket markets, execu
 ## Project Structure
 
 ```text
-PolyFarm/
+Artificial-Liquidity/
 ├── market_scan.py          # Scans Polymarket for cheap, active markets
 ├── cross_fill.py           # Executes chain-trade strategy on a single market
 ├── cross_fill_runner.py    # Orchestrates multiple cross-fill runs from cheap_markets.txt

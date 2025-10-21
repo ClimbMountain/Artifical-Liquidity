@@ -1,38 +1,40 @@
 #!/usr/bin/env python3
 
-import os
-import time
-import csv
 import argparse
+import csv
+import logging
 import random
-import urllib.parse
-import requests
+import time
 from datetime import datetime
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import MarketOrderArgs, OrderArgs, OrderType
-from database_manager import DatabaseManager
 from decimal import Decimal, ROUND_DOWN
+from typing import Dict, List, Optional, Tuple
 
-def record_sequence(db_manager, session_uuid, iteration_number, group,
-                    mark_initial=False, mark_final=False):
-    """
-    Write one row per wallet in the chain into chain_sequences.
-    """
-    for order, w in enumerate(group):
+import requests
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import OrderArgs, OrderType
+
+from database_manager import DatabaseManager
+from logging_config import configure_logging
+from settings import load_settings
+
+def record_sequence(db_manager: DatabaseManager, session_uuid: str, iteration_number: int, group: List[Dict],
+                    mark_initial: bool = False, mark_final: bool = False) -> None:
+    """Persist one row per wallet in the chain into `chain_sequences`."""
+    for order, wallet in enumerate(group):
         db_manager.add_chain_step(
             session_uuid=session_uuid,
             iteration_number=iteration_number,
             sequence_order=order,
-            wallet_id=w['db_id'],
+            wallet_id=wallet['db_id'],
             is_initial_buy=(mark_initial and order == 0),
             is_final_sell=(mark_final and order == len(group) - 1),
         )
 
-def quantize_decimal(val, digits=5):
+def quantize_decimal(val: float, digits: int = 5) -> Decimal:
     return Decimal(str(val)).quantize(Decimal(f'1e-{digits}'), rounding=ROUND_DOWN)
 
-def get_prices_and_tokens(condition_id: str, side: str, db_manager: DatabaseManager = None) -> str:
-    """Fetch the token_id for the given condition and outcome side ("yes" or "no")."""
+def get_prices_and_tokens(condition_id: str, side: str, db_manager: Optional[DatabaseManager] = None) -> str:
+    """Fetch token_id for given condition/outcome side ("yes" or "no")."""
     url = f"https://clob.polymarket.com/rewards/markets/{condition_id}"
     resp = requests.get(url)
     resp.raise_for_status()
@@ -59,8 +61,8 @@ def get_prices_and_tokens(condition_id: str, side: str, db_manager: DatabaseMana
                     )
                 conn.commit()
             db_manager.log_message(f"Market condition {condition_id} stored in database", "INFO")
-        except Exception as e:
-            db_manager.log_message(f"Failed to store market condition: {str(e)}", "WARNING")
+        except Exception as exc:
+            db_manager.log_message(f"Failed to store market condition: {str(exc)}", "WARNING")
 
     for token in market_data['tokens']:
         if token['outcome'].lower() == side.lower():
@@ -68,7 +70,7 @@ def get_prices_and_tokens(condition_id: str, side: str, db_manager: DatabaseMana
     raise ValueError(f"Token for side '{side}' not found in market {condition_id}")
 
 
-def fetch_nbbo(token_id: str) -> (float, float):
+def fetch_nbbo(token_id: str) -> Tuple[Optional[float], Optional[float]]:
     """Return (best_bid, best_ask) for the given token_id."""
     url = f"https://clob.polymarket.com/book?token_id={token_id}"
     resp = requests.get(url)
@@ -92,23 +94,23 @@ def get_yes_position_volume(proxy_wallet: str, condition_id: str) -> float:
     return sum(pos.get("size", 0) for pos in positions if pos.get("outcome", "").lower() == "yes")
 
 
-def init_client(private_key: str, funder: str) -> ClobClient:
+def init_client(private_key: str, funder: str, host: str, chain_id: int, signature_type: int) -> ClobClient:
     """Initialize and return a configured ClobClient."""
     client = ClobClient(
-        host="https://clob.polymarket.com",
-        chain_id=137,
+        host=host,
+        chain_id=chain_id,
         key=private_key,
-        signature_type=2,
-        funder=funder
+        signature_type=signature_type,
+        funder=funder,
     )
     creds = client.create_or_derive_api_creds()
     client.set_api_creds(creds)
     return client
 
 
-def load_wallets(csv_path: str, db_manager: DatabaseManager) -> list:
+def load_wallets(csv_path: str, db_manager: DatabaseManager) -> List[Dict]:
     """Load (private_key, funder) pairs and store wallets in DB."""
-    wallets = []
+    wallets: List[Dict] = []
     with open(csv_path, newline='') as f:
         reader = csv.DictReader(f)
         for idx, row in enumerate(reader):
@@ -135,28 +137,30 @@ def load_wallets(csv_path: str, db_manager: DatabaseManager) -> list:
             })
     return wallets
 
-def chain_trade(group, condition_id, token_id, initial_size, buy_price, mid_price,
-                skip_initial_buy=False, db_manager=None, session_uuid=None):
-    """
-    Execute a buy-then-sell chain across a list of wallets, verifying on-chain positions.
-    Uses on-chain delta checks rather than assuming zero starting volume.
-    """
+def chain_trade(group: List[Dict], condition_id: str, token_id: str, initial_size: float,
+                buy_price: float, mid_price: float, *, skip_initial_buy: bool = False,
+                db_manager: Optional[DatabaseManager] = None, session_uuid: Optional[str] = None) -> None:
+    """Execute a buy-then-sell chain across wallets, verifying on-chain positions."""
     size = initial_size
 
     # 1) Initial buy if needed
     if not skip_initial_buy:
-        buyer0    = group[0]
+        buyer0 = group[0]
         start_vol0 = get_yes_position_volume(buyer0['wallet_address'], condition_id)
-        acquired  = 0.0
+        acquired = 0.0
 
         if start_vol0 >= size:
-            print(f"[SKIP BUY] Wallet {buyer0['db_id']} already has {start_vol0:.4f} ≥ {size}")
+            logging.getLogger(__name__).info("Skip initial buy: wallet %s already has %.4f ≥ %.4f",
+                                             buyer0['db_id'], start_vol0, size)
             acquired = size
         else:
             # keep buying until we have the desired size on-chain
             while acquired < size:
                 remaining = size - acquired
-                print(f"[BUY   ] Wallet {buyer0['db_id']} start {start_vol0 + acquired:.4f} → buying remaining {remaining:.4f} @ {buy_price:.4f}")
+                logging.getLogger(__name__).info(
+                    "Initial buy wallet %s: start %.4f → buying remaining %.4f @ %.4f",
+                    buyer0['db_id'], start_vol0 + acquired, remaining, buy_price,
+                )
                 resp = buyer0['client'].post_order(
                     buyer0['client'].create_order(
                         OrderArgs(price=buy_price, size=remaining, side="BUY", token_id=token_id)
@@ -164,20 +168,20 @@ def chain_trade(group, condition_id, token_id, initial_size, buy_price, mid_pric
                     orderType=OrderType.GTC
                 )
                 order_id = resp.get('orderID') if isinstance(resp, dict) else resp
-                print(f"Order response: {resp}")
+                logging.getLogger(__name__).debug("Buy order response: %s", resp)
 
                 time.sleep(random.uniform(10, 13))
 
                 post_vol0 = get_yes_position_volume(buyer0['wallet_address'], condition_id)
                 acquired = post_vol0 - start_vol0
-                print(f"On-chain post-buy: {post_vol0:.4f} (+{acquired:.4f})")
+                logging.getLogger(__name__).info("On-chain post-buy: %.4f (+%.4f)", post_vol0, acquired)
 
                 if acquired < size:
                     try:
                         cancel_resp = buyer0['client'].cancel(order_id)
-                        print(f"[CANCEL] Canceled partial buy order {order_id}: {cancel_resp}")
-                    except Exception as e:
-                        print(f"[CANCEL FAIL] Could not cancel order {order_id}: {e}")
+                        logging.getLogger(__name__).warning("Canceled partial buy order %s: %s", order_id, cancel_resp)
+                    except Exception as exc:
+                        logging.getLogger(__name__).error("Could not cancel order %s: %s", order_id, exc)
 
             # now we’ve done at least one order, so `order_id` is set
             if db_manager and session_uuid:
@@ -195,33 +199,39 @@ def chain_trade(group, condition_id, token_id, initial_size, buy_price, mid_pric
     # 2) Chain matches
     for i in range(1, len(group)):
         seller = group[i-1]
-        buyer  = group[i]
+        buyer = group[i]
         remaining = size
         attempt = 1
         # record starting balances for delta
         start_seller = get_yes_position_volume(seller['wallet_address'], condition_id)
-        start_buyer  = get_yes_position_volume(buyer['wallet_address'], condition_id)
-        print(f"[MATCH ] {seller['db_id']} start {start_seller} → {buyer['db_id']} start {start_buyer}, matching {remaining} @ {mid_price:.4f}")
+        start_buyer = get_yes_position_volume(buyer['wallet_address'], condition_id)
+        logging.getLogger(__name__).info(
+            "Match %s→%s: seller start %.4f, buyer start %.4f, size %.4f @ %.4f",
+            seller['db_id'], buyer['db_id'], start_seller, start_buyer, remaining, mid_price,
+        )
 
         while remaining > 0:
-            print(f"[ATTEMPT] #{attempt} for {remaining} shares")
+            logging.getLogger(__name__).debug("Attempt #%d for %.4f shares", attempt, remaining)
             sell_args = OrderArgs(price=mid_price, size=remaining, side="SELL", token_id=token_id)
-            buy_args  = OrderArgs(price=mid_price, size=remaining, side="BUY",  token_id=token_id)
+            buy_args = OrderArgs(price=mid_price, size=remaining, side="BUY", token_id=token_id)
             sell_resp = seller['client'].post_order(
                 seller['client'].create_order(sell_args), orderType=OrderType.GTC
             )
-            buy_resp  = buyer ['client'].post_order(
-                buyer ['client'].create_order(buy_args), orderType=OrderType.GTC
+            buy_resp = buyer['client'].post_order(
+                buyer['client'].create_order(buy_args), orderType=OrderType.GTC
             )
-            print(f"Sell resp: {sell_resp}\nBuy resp: {buy_resp}")
+            logging.getLogger(__name__).debug("Sell resp: %s | Buy resp: %s", sell_resp, buy_resp)
             time.sleep(random.uniform(4,8))
 
             # compute deltas
             post_seller = get_yes_position_volume(seller['wallet_address'], condition_id)
-            post_buyer  = get_yes_position_volume(buyer ['wallet_address'], condition_id)
+            post_buyer = get_yes_position_volume(buyer['wallet_address'], condition_id)
             sold = start_seller - post_seller
             bought = post_buyer - start_buyer
-            print(f"On-chain: seller {start_seller}->{post_seller} sold {sold}; buyer {start_buyer}->{post_buyer} bought {bought}")
+            logging.getLogger(__name__).info(
+                "On-chain: seller %.4f→%.4f sold %.4f; buyer %.4f→%.4f bought %.4f",
+                start_seller, post_seller, sold, start_buyer, post_buyer, bought,
+            )
 
             # full match
             if sold >= remaining and bought >= remaining:
@@ -236,7 +246,7 @@ def chain_trade(group, condition_id, token_id, initial_size, buy_price, mid_pric
 
             # partial fill
             elif sold > 0 and sold < remaining:
-                print(f"[PARTIAL] {sold} filled, {remaining - sold} remains")
+                logging.getLogger(__name__).info("Partial fill: %.4f filled, %.4f remains", sold, remaining - sold)
                 oid_buy  = buy_resp.get('orderID')  if isinstance(buy_resp, dict)  else buy_resp
                 oid_sell = sell_resp.get('orderID') if isinstance(sell_resp, dict) else sell_resp
                 buyer['client'].cancel(oid_buy)
@@ -248,36 +258,39 @@ def chain_trade(group, condition_id, token_id, initial_size, buy_price, mid_pric
             # fallback misfill/divert with original divert logic
             # fallback misfill/divert with re-check logic
             else:
-                print(f"[MISFILL/DIVERT] sold {sold}, bought {bought}, fallback handling")
+                logging.getLogger(__name__).warning("Misfill/divert: sold %.4f, bought %.4f", sold, bought)
                 # give on-chain a moment and re-check
                 time.sleep(2)
                 re_seller = get_yes_position_volume(seller['wallet_address'], condition_id)
-                re_buyer  = get_yes_position_volume(buyer ['wallet_address'], condition_id)
-                re_sold   = start_seller - re_seller
-                re_bought = re_buyer  - start_buyer
-                print(f"[RECHECK] seller {start_seller}->{re_seller} sold {re_sold}; buyer {start_buyer}->{re_buyer} bought {re_bought}")
+                re_buyer = get_yes_position_volume(buyer['wallet_address'], condition_id)
+                re_sold = start_seller - re_seller
+                re_bought = re_buyer - start_buyer
+                logging.getLogger(__name__).info(
+                    "Recheck: seller %.4f→%.4f sold %.4f; buyer %.4f→%.4f bought %.4f",
+                    start_seller, re_seller, re_sold, start_buyer, re_buyer, re_bought,
+                )
                 # if it actually filled, move on
                 if re_sold >= remaining and re_bought >= remaining:
-                    print("[RECHECK] It actually filled—continuing chain")
+                    logging.getLogger(__name__).info("Recheck indicates full fill; continuing chain")
                     remaining = 0
                     break
 
                 # Divert: buyer acquired elsewhere but seller still holds
                 if bought >= remaining and sold < remaining:
-                    print(f"[DIVERT] Buyer bought elsewhere, seller still has {post_seller}")
+                    logging.getLogger(__name__).info("Divert: buyer bought elsewhere, seller still has %.4f", post_seller)
                     best_bid, _ = fetch_nbbo(token_id)
                     if post_seller > 0 and best_bid:
                         div_args = OrderArgs(price=best_bid, size=post_seller, side="SELL", token_id=token_id)
                         div_resp = seller['client'].post_order(
                             seller['client'].create_order(div_args), orderType=OrderType.GTC
                         )
-                        print(f"[DIVERT] Market sell of diverted shares @ {best_bid:.4f}: {div_resp}")
+                        logging.getLogger(__name__).info("Divert: market sell of diverted shares @ %.4f: %s", best_bid, div_resp)
                     # continue with remaining chain
                     break
 
                 # Misfill: seller sold but buyer got nothing
                 if sold >= remaining and bought == 0:
-                    print(f"[MISFILL] Seller sold but buyer got none; restart initial buy")
+                    logging.getLogger(__name__).warning("Misfill: seller sold but buyer got none; restarting initial buy")
                     buyer['client'].cancel(buy_resp.get('orderID') if isinstance(buy_resp, dict) else buy_resp)
                     return chain_trade(
                         group, condition_id, token_id, initial_size, buy_price, mid_price,
@@ -289,7 +302,7 @@ def chain_trade(group, condition_id, token_id, initial_size, buy_price, mid_pric
                 oid_sell = sell_resp.get('orderID') if isinstance(sell_resp, dict) else sell_resp
                 buyer['client'].cancel(oid_buy)
                 seller['client'].cancel(oid_sell)
-                print(f"[FAIL] Unexpected state; retrying remainder {remaining}")
+                logging.getLogger(__name__).warning("Unexpected state; retrying remainder %.4f", remaining)
                 continue
         # end while
         size = initial_size  # reset for next wallet pair
@@ -299,7 +312,7 @@ def chain_trade(group, condition_id, token_id, initial_size, buy_price, mid_pric
 
 # --- Main execution ---
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Chain-trade across N wallets from a CSV."
     )
@@ -320,24 +333,27 @@ def main():
         help="Trade size (number of shares/contracts) per order"
     )
     parser.add_argument(
-        "--db-path", default="polyfarm.db",
+        "--db-path", default=None,
         help="Path to SQLite database file"
     )
     args = parser.parse_args()
 
-    # Initialize database
-    db_manager = DatabaseManager(args.db_path)
+    settings = load_settings()
+    configure_logging(settings.log_level)
+
+    db_path = args.db_path or settings.db_path
+    db_manager = DatabaseManager(db_path)
     db_manager.log_message("Trading session started", "INFO")
         
     try:
         wallet_entries = load_wallets(args.wallets, db_manager)
         clients = []
         for idx, w in enumerate(wallet_entries):
-            pk     = w['private_key']
+            pk = w['private_key']
             funder = w['wallet_address']
-            db_id  = w['db_id']
+            db_id = w['db_id']
 
-            client = init_client(pk, funder)
+            client = init_client(pk, funder, settings.clob_host, settings.chain_id, settings.clob_signature_type)
             clients.append({
                 'id': idx,
                 'client': client,
@@ -423,9 +439,9 @@ def main():
             last_wallet_obj = group[-1]
 
         # Final market-like SELL at best_bid
-        final_id     = last_wallet_obj['id']
+        final_id = last_wallet_obj['id']
         final_client = last_wallet_obj['client']
-        print(f"[SELL  ] Final Wallet {final_id} @ {best_bid:.2f}")
+        logging.getLogger(__name__).info("Final sell wallet %s @ %.2f", final_id, best_bid)
         sell_args = OrderArgs(
             price=best_bid,
             size=size,
@@ -434,7 +450,7 @@ def main():
         )
         order = final_client.create_order(sell_args)
         response = final_client.post_order(order, orderType=OrderType.GTC)
-        print(response)
+        logging.getLogger(__name__).debug("Final sell response: %s", response)
         
         # Log final sell to database
         try:
@@ -449,15 +465,15 @@ def main():
                 order_id=str(response.get('orderID', '')) if isinstance(response, dict) else str(response)
             )
             db_manager.log_message(f"Final sell logged: Wallet {final_id} @ {best_bid:.2f}", "INFO", session_uuid)
-        except Exception as e:
-            db_manager.log_message(f"Failed to log final sell: {str(e)}", "ERROR", session_uuid)
+        except Exception as exc:
+            db_manager.log_message(f"Failed to log final sell: {str(exc)}", "ERROR", session_uuid)
 
         # Mark session as completed
         db_manager.update_session_status(session_uuid, "completed", datetime.now())
         db_manager.log_message("Trading session completed successfully", "INFO", session_uuid)
 
-    except Exception as e:
-        db_manager.log_message(f"Trading session failed: {str(e)}", "ERROR")
+    except Exception as exc:
+        db_manager.log_message(f"Trading session failed: {str(exc)}", "ERROR")
         if 'session_uuid' in locals():
             db_manager.update_session_status(session_uuid, "failed", datetime.now())
         raise

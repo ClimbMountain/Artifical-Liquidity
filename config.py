@@ -1,26 +1,39 @@
 import csv
+import logging
 from pathlib import Path
+from typing import Dict, List, Optional
+
 from py_clob_client.client import ClobClient
-from typing import Dict, List
 
-# ---- grab first key/funder from wallets.csv ----
-def _first_wallet(csv_name: str = "wallets.csv"):
-    path = Path(__file__).with_name(csv_name)
+from logging_config import configure_logging
+from settings import load_settings
+
+
+def _first_wallet(csv_name: str) -> Optional[Dict[str, str]]:
+    """Return first wallet row from CSV or None if not found."""
+    path = Path(csv_name)
+    if not path.exists():
+        return None
     with path.open(newline="") as f:
-        row = next(csv.DictReader(f))  # first row only
-    return row["private_key"].strip(), row["funder"].strip()
+        reader = csv.DictReader(f)
+        try:
+            row = next(reader)
+            return {"private_key": row["private_key"].strip(), "funder": row["funder"].strip()}
+        except StopIteration:
+            return None
 
-_PRIVATE_KEY, _FUNDER = _first_wallet()
-# ------------------------------------------------
 
 class PolymarketClient:
-    def __init__(self, host: str, chain_id: int):
+    """Thin wrapper around ClobClient for basic market queries used by scanner."""
+
+    def __init__(self, host: str, chain_id: int, key: str, funder: str, signature_type: int = 2):
+        self.logger = logging.getLogger(self.__class__.__name__)
         self.client = ClobClient(
             host=host,
             chain_id=chain_id,
-            key=_PRIVATE_KEY,
-            signature_type=1,
-            funder=_FUNDER,
+            key=key,
+            signature_type=signature_type,
+            funder=funder,
         )
 
     def get_top_markets_by_price(self, top_n: int = 50) -> List[Dict]:
@@ -30,7 +43,8 @@ class PolymarketClient:
         for market in self.get_all_markets():
             try:
                 ob = self.get_orderbook(market["condition_id"])
-            except Exception:
+            except Exception as exc:
+                self.logger.debug("Skipping market without orderbook: %s", exc)
                 continue
 
             spreads: List[float] = []
@@ -54,7 +68,7 @@ class PolymarketClient:
                     market["price"] = min(asks)
                     candidates.append(market)
 
-        candidates.sort(key=lambda m: m["price"])
+        candidates.sort(key=lambda m: m["price"])  # type: ignore[index]
         return candidates[:top_n]
 
     def get_all_markets(self) -> List[Dict]:
@@ -84,16 +98,32 @@ class PolymarketClient:
             outcome = token.get("outcome")
             orderbook = self.client.get_order_book(token_id)
 
-        orderbook_data[outcome] = {
+            orderbook_data[outcome] = {
                 "bids": [{"price": float(b.price), "size": float(b.size)} for b in orderbook.bids],
                 "asks": [{"price": float(a.price), "size": float(a.size)} for a in orderbook.asks],
             }
 
         return orderbook_data
 
-    def get_market_details(self, condition_id: str) -> Dict:
+    def get_market_details(self, condition_id: str) -> Optional[Dict]:
         try:
             return self.client.get_market(condition_id)
-        except Exception as e:
-            print(f"Error fetching market: {e}")
+        except Exception as exc:
+            logging.getLogger(self.__class__.__name__).warning("Error fetching market %s: %s", condition_id, exc)
             return None
+
+
+def build_scanner_client() -> Optional[PolymarketClient]:
+    """Construct a `PolymarketClient` using first wallet from CSV and env settings."""
+    settings = load_settings()
+    wallet = _first_wallet(settings.wallets_csv)
+    if not wallet:
+        logging.getLogger(__name__).error("No wallets found at %s", settings.wallets_csv)
+        return None
+    return PolymarketClient(
+        host=settings.clob_host,
+        chain_id=settings.chain_id,
+        key=wallet["private_key"],
+        funder=wallet["funder"],
+        signature_type=settings.clob_signature_type,
+    )

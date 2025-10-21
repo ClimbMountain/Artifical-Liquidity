@@ -2,19 +2,25 @@ import sqlite3
 import hashlib
 import uuid
 import json
+import logging
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Iterator
 from contextlib import contextmanager
+
+from logging_config import configure_logging
+from settings import load_settings
 
 
 class DatabaseManager:
-    
+    """SQLite-backed persistence layer for sessions, trades, wallets and logs."""
+
     def __init__(self, db_path: str = "polyfarm.db"):
         self.db_path = db_path
+        self.logger = logging.getLogger(self.__class__.__name__)
         self.init_database()
     
-    def init_database(self):
-        """Initialize the database with the schema."""
+    def init_database(self) -> None:
+        """Initialize the database with the schema if not present."""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='wallets'"
@@ -28,10 +34,10 @@ class DatabaseManager:
                     schema = f.read()
                     conn.executescript(schema)
             except FileNotFoundError:
-                print("Warning: database_schema.sql not found. Creating basic schema.")
+                self.logger.warning("database_schema.sql not found. Creating basic schema.")
                 self._create_basic_schema(conn)
     
-    def _create_basic_schema(self, conn):
+    def _create_basic_schema(self, conn: sqlite3.Connection) -> None:
         """Create basic schema if schema file is not found."""
         conn.execute("""
             CREATE TABLE IF NOT EXISTS wallets (
@@ -72,7 +78,7 @@ class DatabaseManager:
         """)
     
     @contextmanager
-    def get_connection(self):
+    def get_connection(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
@@ -81,7 +87,7 @@ class DatabaseManager:
         finally:
             conn.close()
     
-    def add_wallet(self, wallet_index: int, private_key: str, funder_address: str, nickname: str = None) -> int:
+    def add_wallet(self, wallet_index: int, private_key: str, funder_address: str, nickname: Optional[str] = None) -> int:
         private_key_hash = hashlib.sha256(private_key.encode()).hexdigest()
         
         with self.get_connection() as conn:
@@ -103,7 +109,7 @@ class DatabaseManager:
             cursor = conn.execute(query)
             return [dict(row) for row in cursor.fetchall()]
     
-    def deactivate_wallet(self, wallet_id: int):
+    def deactivate_wallet(self, wallet_id: int) -> None:
         with self.get_connection() as conn:
             conn.execute("UPDATE wallets SET is_active = FALSE WHERE id = ?", (wallet_id,))
             conn.commit()
@@ -132,7 +138,7 @@ class DatabaseManager:
             row = cursor.fetchone()
             return dict(row) if row else None
     
-    def update_session_status(self, session_uuid: str, status: str, end_time: datetime = None):
+    def update_session_status(self, session_uuid: str, status: str, end_time: Optional[datetime] = None) -> None:
         with self.get_connection() as conn:
             if end_time:
                 conn.execute(
@@ -147,7 +153,7 @@ class DatabaseManager:
             conn.commit()
     
     def log_trade(self, session_uuid: str, wallet_id: int, token_id: str, side: str, 
-                 price: float, size: float, trade_type: str, order_id: str = None) -> int:
+                 price: float, size: float, trade_type: str, order_id: Optional[str] = None) -> int:
         session = self.get_session_by_uuid(session_uuid)
         if not session:
             raise ValueError(f"Session {session_uuid} not found")
@@ -162,8 +168,8 @@ class DatabaseManager:
             conn.commit()
             return cursor.lastrowid
     
-    def update_trade_status(self, trade_id: int, status: str, fill_price: float = None, 
-                           fill_size: float = None, fees: float = None):
+    def update_trade_status(self, trade_id: int, status: str, fill_price: Optional[float] = None, 
+                           fill_size: Optional[float] = None, fees: Optional[float] = None) -> None:
         with self.get_connection() as conn:
             if fill_price is not None and fill_size is not None:
                 conn.execute(
@@ -180,7 +186,7 @@ class DatabaseManager:
             conn.commit()
     
     def save_market_data(self, token_id: str, best_bid: float, best_ask: float, 
-                        session_uuid: str = None):
+                        session_uuid: Optional[str] = None) -> None:
         session_id = None
         if session_uuid:
             session = self.get_session_by_uuid(session_uuid)
@@ -196,8 +202,8 @@ class DatabaseManager:
             )
             conn.commit()
     
-    def log_message(self, message: str, log_level: str = "INFO", session_uuid: str = None, 
-                   details: Dict = None):
+    def log_message(self, message: str, log_level: str = "INFO", session_uuid: Optional[str] = None, 
+                   details: Optional[Dict] = None) -> None:
         session_id = None
         if session_uuid:
             session = self.get_session_by_uuid(session_uuid)
@@ -269,7 +275,7 @@ class DatabaseManager:
             row = cursor.fetchone()
             return row['setting_value'] if row else None
     
-    def set_setting(self, key: str, value: str):
+    def set_setting(self, key: str, value: str) -> None:
         with self.get_connection() as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO app_settings (setting_key, setting_value)
@@ -278,12 +284,12 @@ class DatabaseManager:
             )
             conn.commit()
     
-    def backup_database(self, backup_path: str):
+    def backup_database(self, backup_path: str) -> None:
         with sqlite3.connect(self.db_path) as source:
             with sqlite3.connect(backup_path) as backup:
                 source.backup(backup)
     
-    def vacuum_database(self):
+    def vacuum_database(self) -> None:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("VACUUM") 
 
@@ -293,7 +299,7 @@ class DatabaseManager:
                     sequence_order: int,
                     wallet_id: int,
                     is_initial_buy: bool = False,
-                    is_final_sell: bool = False):
+                    is_final_sell: bool = False) -> None:
         """Insert one row into chain_sequences for UI chain display."""
         session = self.get_session_by_uuid(session_uuid)
         if not session:
@@ -316,9 +322,10 @@ class DatabaseManager:
             )
             conn.commit()
 
-    def add_chain_batch(self, session_uuid: str, rows: list[tuple]):
-        """
-        rows = [(iteration_number, sequence_order, wallet_id, initial_bool, final_bool), ...]
+    def add_chain_batch(self, session_uuid: str, rows: List[Tuple[int, int, int, bool, bool]]) -> None:
+        """Bulk insert chain sequence rows.
+
+        rows format: (iteration_number, sequence_order, wallet_id, is_initial_buy, is_final_sell)
         """
         session = self.get_session_by_uuid(session_uuid)
         if not session:
